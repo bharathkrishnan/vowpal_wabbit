@@ -34,7 +34,15 @@ struct global_data {
 
   bool conjugate_gradient;
   float regularization;
+
+  bool bfgs;
+  bool hessian_on;
+  int m;
+
   size_t stride;
+  string per_feature_regularizer_input;
+  string per_feature_regularizer_output;
+  string per_feature_regularizer_text;
   
   float l_1_regularization;//the level of l_1 regularization to impose.
   float update_sum;
@@ -76,6 +84,8 @@ struct global_data {
   size_t num_threads () { return 1 << thread_bits; };
   size_t num_partitions () { return 1 << partition_bits; };
   size_t length () { return 1 << num_bits; };
+
+  size_t rank;
 
   //Prediction output
   v_array<int_pair> final_prediction_sink; // set to send global predictions to.
