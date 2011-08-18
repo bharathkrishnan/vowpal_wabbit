@@ -55,7 +55,9 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
     ("regularization", po::value<float>(&global.regularization)->default_value(1.0), "l_2 regularization for conjugate_gradient")
     ("corrective", "turn on corrective updates")
     ("data,d", po::value< string >()->default_value(""), "Example Set")
-    ("daemon", "read data from port 39523")
+    ("daemon", "read data from port 26542")
+    ("persistent", "persist process for daemon mode")
+    ("pid_file", po::value< string >(), "Write pid file in persistent daemon mode")
     ("decay_learning_rate",    po::value<float>(&global.eta_decay_rate)->default_value(default_decay),
      "Set Decay factor for learning_rate between passes")
     ("input_feature_regularizer", po::value< string >(&global.per_feature_regularizer_input), "Per feature regularization input file")
@@ -121,6 +123,7 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
   global.corrective = false;
   global.delayed_global = false;
   global.conjugate_gradient = false;
+  global.bfgs = false;
   global.hessian_on = false;
   global.stride = 1;
   global.weighted_labels = 0.;
@@ -130,6 +133,7 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
   global.dump_interval = exp(1.);
   global.num_bits = 18;
   global.default_bits = true;
+  global.persistent = false;
   global.final_prediction_sink.begin = global.final_prediction_sink.end=global.final_prediction_sink.end_array = NULL;
   global.raw_prediction = -1;
   global.local_prediction = -1;
@@ -226,6 +230,9 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
   if (vm.count("bfgs")) {
     global.bfgs = true;
     global.stride = 4;
+    if (vm.count("hessian_on")) {
+      global.hessian_on = true;
+    }
     if (!global.quiet) {
        if (global.m>0)
 	 cerr << "enabling BFGS based optimization ";
@@ -244,8 +251,10 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
     if (global.conjugate_gradient)
       {
 	cout << "you cannot enable both conjugate gradient and BFGS" << endl;
+	exit(1);
       }
   }
+
 
   if (vm.count("version") || argc == 1) {
     /* upon direct query for version -- spit it out to stdout */
@@ -256,10 +265,10 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
 
   if(vm.count("ngram")){
     global.ngram = vm["ngram"].as<size_t>();
-    if(!vm.count("skip_gram")) cout << "You have chosen to generate " << global.ngram << "-grams" << endl;
+    if(!vm.count("skip_gram")) cerr << "You have chosen to generate " << global.ngram << "-grams" << endl;
     if(vm.count("sort_features"))
       {
-	cout << "ngram is incompatible with sort_features.  " << endl;
+	cerr << "ngram is incompatible with sort_features.  " << endl;
 	exit(1);
       }
   }
@@ -271,7 +280,7 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
 	cout << "You can not skip unless ngram is > 1" << endl;
 	exit(1);
       }
-    cout << "You have chosen to generate " << global.skips << "-skip-" << global.ngram << "-grams" << endl;
+    cerr << "You have chosen to generate " << global.skips << "-skip-" << global.ngram << "-grams" << endl;
     if(global.skips > 4)
       {
       cout << "*********************************" << endl;
@@ -290,6 +299,13 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
 	}
     }
   
+  if (vm.count("persistent")) {
+    global.persistent = true;
+
+    // allow each child to process up to 1e5 connections
+    global.numpasses = (size_t) 1e5;
+  }
+
   string data_filename = vm["data"].as<string>();
   if (vm.count("compressed") || ends_with(data_filename, ".gz"))
     set_compressed(par);
@@ -366,7 +382,7 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
     }
   if (!vm.count("lda"))
     global.eta *= pow(par->t, vars.power_t);
-
+  
   parse_regressor_args(vm, r, final_regressor_name, global.quiet);
   parse_source_args(vm,par,global.quiet,global.numpasses);
   if (vm.count("readable_model"))
@@ -387,7 +403,6 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
 	  loss_function = vm["loss_function"].as<string>();
   else
 	  loss_function = "squaredloss";
-
   double loss_parameter = 0.0;
   if(vm.count("quantile_tau"))
     loss_parameter = vm["quantile_tau"].as<double>();
@@ -406,7 +421,7 @@ po::variables_map parse_args(int argc, char *argv[], boost::program_options::opt
     cerr << "Warning: decay_learning_rate has no effect when there is only one pass" << endl;
 
   if (pow((double)global.eta_decay_rate, (double)global.numpasses) < 0.0001 )
-    cerr << "Warning: the learning rate for the last pass is multiplied by: " << pow(global.eta_decay_rate, global.numpasses)
+    cerr << "Warning: the learning rate for the last pass is multiplied by: " << pow((double)global.eta_decay_rate, (double)global.numpasses)
 	 << " adjust --decay_learning_rate larger to avoid this." << endl;
 
   //parse_source_args(vm,par,global.quiet,global.numpasses);

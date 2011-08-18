@@ -34,13 +34,14 @@ void initialize_regressor(regressor &r)
 
       // random weight initialization for matrix factorization
       if (global.random_weights)
-	if (global.rank > 0)
-	  for (size_t j = 0; j < global.stride*length/num_threads; j++)
-	    r.weight_vectors[i][j] = (double) 0.1 * rand() / ((double) RAND_MAX + 1.0); //drand48()/10 - 0.05;
-        else
-	  for (size_t j = 0; j < length/num_threads; j++)
-	    r.weight_vectors[i][j] = drand48() - 0.5;
-
+	{
+	  if (global.rank > 0)
+	    for (size_t j = 0; j < global.stride*length/num_threads; j++)
+	      r.weight_vectors[i][j] = (double) 0.1 * rand() / ((double) RAND_MAX + 1.0); //drand48()/10 - 0.05;
+	  else
+	    for (size_t j = 0; j < length/num_threads; j++)
+	      r.weight_vectors[i][j] = drand48() - 0.5;
+	}
       if (r.regularizers != NULL)
 	r.regularizers[i] = (weight *)calloc(2*length/num_threads, sizeof(weight));
       if (r.weight_vectors[i] == NULL || (r.regularizers != NULL && r.regularizers[i] == NULL))
@@ -81,6 +82,7 @@ void read_vector(const char* file, regressor& r, bool& initialized, bool reg_vec
       cout << "can't open " << file << endl << " ... exiting." << endl;
       exit(1);
     }
+
   
   size_t v_length;
   source.read((char*)&v_length, sizeof(v_length));
@@ -137,6 +139,39 @@ void read_vector(const char* file, regressor& r, bool& initialized, bool reg_vec
       string temp(pair, 2);
       local_pairs.push_back(temp);
     }
+
+
+  size_t local_rank;
+  source.read((char*)&local_rank, sizeof(local_rank));
+  size_t local_lda;
+  source.read((char*)&local_lda, sizeof(local_lda));
+  if (!initialized)
+    {
+      global.rank = local_rank;
+      global.lda = local_lda;
+      //initialized = true;
+    }
+  else
+    {
+      cout << "can't combine regressors" << endl;
+      exit(1);
+    }
+
+  if (global.rank > 0)
+    {
+      float temp = ceilf(logf((float)(global.rank*2+1)) / logf (2.f));
+      global.stride = 1 << (int) temp;
+      global.random_weights = true;
+    }
+  
+  if (global.lda > 0)
+    {
+      // par->sort_features = true;
+      float temp = ceilf(logf((float)(global.lda*2+1)) / logf (2.f));
+      global.stride = 1 << (int) temp;
+      global.random_weights = true;
+    }
+
   if (!initialized)
     {
       global.pairs = local_pairs;
@@ -170,6 +205,7 @@ void read_vector(const char* file, regressor& r, bool& initialized, bool reg_vec
 	cout << "can't combine sources with different ngram features!" << endl;
 	exit(1);
       }
+
   size_t stride = global.stride;
   while (source.good())
     {
@@ -208,7 +244,7 @@ void parse_regressor_args(po::variables_map& vm, regressor& r, string& final_reg
     final_regressor_name = "";
 
   vector<string> regs;
-  if (vm.count("initial_regressor"))
+  if (vm.count("initial_regressor") || vm.count("i"))
     regs = vm["initial_regressor"].as< vector<string> >();
   
   /* 
@@ -227,7 +263,10 @@ void parse_regressor_args(po::variables_map& vm, regressor& r, string& final_reg
   if (!initialized)
     {
       if(vm.count("noop") || vm.count("sendto"))
-	r.weight_vectors = NULL;
+	{
+	  r.weight_vectors = NULL;
+	  r.regularizers = NULL;
+	}
       else
 	initialize_regressor(r);
     }
@@ -280,6 +319,9 @@ void dump_regressor(string reg_name, regressor &r, bool as_text, bool reg_vector
     for (vector<string>::iterator i = global.pairs.begin(); i != global.pairs.end();i++) 
       io_temp.write_file(f,i->c_str(),2);
 
+    io_temp.write_file(f,(char*)&global.rank, sizeof(global.rank));
+    io_temp.write_file(f,(char*)&global.lda, sizeof(global.lda));
+
     io_temp.write_file(f,(char*)&global.ngram, sizeof(global.ngram));
     io_temp.write_file(f,(char*)&global.skips, sizeof(global.skips));
   }
@@ -302,6 +344,12 @@ void dump_regressor(string reg_name, regressor &r, bool as_text, bool reg_vector
 	io_temp.write_file(f, buff, len);
       }
     len = sprintf(buff, "ngram:%d skips:%d\nindex:weight pairs:\n", (int)global.ngram, (int)global.skips);
+    io_temp.write_file(f, buff, len);
+
+    len = sprintf(buff, "rank:%d\n", (int)global.rank);
+    io_temp.write_file(f, buff, len);
+
+    len = sprintf(buff, "lda:%d\n", (int)global.lda);
     io_temp.write_file(f, buff, len);
   }
   

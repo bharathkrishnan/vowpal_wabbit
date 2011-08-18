@@ -25,6 +25,8 @@ struct global_data {
   size_t num_bits; // log_2 of the number of features.
   bool default_bits;
 
+  bool persistent; 
+
   bool backprop;
   bool corrective;
   bool delayed_global;
@@ -40,6 +42,8 @@ struct global_data {
   int m;
 
   size_t stride;
+
+
   string per_feature_regularizer_input;
   string per_feature_regularizer_output;
   string per_feature_regularizer_text;
@@ -99,7 +103,7 @@ struct global_data {
   char* program_name;
 
   //runtime accounting variables. 
-  long long int example_number;
+  unsigned long long example_number;
   double initial_t;
   double weighted_examples;
   double weighted_unlabeled_examples;
@@ -123,5 +127,8 @@ void noop_mm(double label);
 void print_lda_result(int f, float* res, float weight, v_array<char> tag);
 
 const size_t ring_size = 1 << 8;
+
+extern pthread_mutex_t output_lock;
+extern pthread_cond_t output_done;
 
 #endif

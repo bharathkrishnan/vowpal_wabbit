@@ -22,9 +22,8 @@ tutorial.
 #include "delay_ring.h"
 #include "allreduce.h"
 #include <sys/timeb.h>
+#include "accumulate.h"
 
-struct timeb t_start, t_end;
-double net_comm_time = 0.0;
 
 void quad_grad_update(weight* weights, feature& page_feature, v_array<feature> &offer_features, size_t mask, float g)
 {
@@ -327,35 +326,6 @@ void update_weight(regressor& reg, float step_size)
     reg.weight_vectors[0][stride*i] += step_size * reg.weight_vectors[0][stride*i+2];
 }
 
-void accumulate(node_socks socks, regressor& reg, size_t o) {
-  ftime(&t_start);
-  uint32_t length = 1 << global.num_bits; //This is size of gradient
-  size_t stride = global.stride;
-  float* local_grad = new float[length];
-  weight* weights = reg.weight_vectors[0];
-  for(uint32_t i = 0;i < length;i++) 
-    {
-      local_grad[i] = weights[stride*i+o];
-    }
-
-  all_reduce((char*)local_grad, length*sizeof(float), socks);
-  for(uint32_t i = 0;i < length;i++) 
-    {
-      weights[stride*i+o] = local_grad[i];
-    }
-  delete[] local_grad;
-  ftime(&t_end);
-  net_comm_time += (int) (1000.0 * (t_end.time - t_start.time) + (t_end.millitm - t_start.millitm)); 
-}
-
-float accumulate_scalar(node_socks socks, float local_sum) {
-  ftime(&t_start);
-  float temp = local_sum;
-  all_reduce((char*)&temp, sizeof(float), socks);
-  ftime(&t_end);
-  net_comm_time += (int) (1000.0 * (t_end.time - t_start.time) + (t_end.millitm - t_start.millitm)); 
-  return temp;
-}
 
 void setup_cg(gd_thread_params& t)
 {
@@ -378,21 +348,16 @@ void setup_cg(gd_thread_params& t)
 
   float* old_first_derivative = (float*) malloc(sizeof(float)*global.length());
 
-  node_socks socks;
   struct timeb t_start_global, t_end_global;
   double net_time = 0.0;
-  double prev_comm_time = 0.0;
-  net_comm_time = 0.0;
   ftime(&t_start_global);
   
-  if(global.master_location != "")
-    all_reduce_init(global.master_location, &socks);
 
   if (!global.quiet)
     {
-      const char * header_fmt = "%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\n";
+      const char * header_fmt = "%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\n";
       fprintf(stderr, header_fmt,
-	      "avg. loss", "mix fraction", "der. mag", "curvature", "step size", "newt. decr.");
+	      "avg. loss", "mix fraction", "der. mag", "curvature", "dir. magnitude", "step size", "newt. decr.", "wolfe ratio");
       fflush(stderr);
       cerr.precision(5);
     }
@@ -415,16 +380,16 @@ void setup_cg(gd_thread_params& t)
 		{
 		  if(global.master_location != "")
 		    {
-		      accumulate(socks, reg, 3); //Accumulate preconditioner
-		      importance_weight_sum = accumulate_scalar(socks, importance_weight_sum);
+		      accumulate(global.master_location, reg, 3); //Accumulate preconditioner
+		      importance_weight_sum = accumulate_scalar(global.master_location, importance_weight_sum);
 		    }
 		  finalize_preconditioner(reg,global.regularization);
 		}
 	      if (gradient_pass) // We just finished computing all gradients
 		{
 		  if(global.master_location != "") {
-		    loss_sum = accumulate_scalar(socks, loss_sum);  //Accumulate loss_sums
-		    accumulate(socks, reg, 1); //Accumulate gradients from all nodes
+		    loss_sum = accumulate_scalar(global.master_location, loss_sum);  //Accumulate loss_sums
+		    accumulate(global.master_location, reg, 1); //Accumulate gradients from all nodes
 		  }
 		  if (global.regularization > 0.)
 		    loss_sum += add_regularization(reg,global.regularization);
@@ -464,7 +429,7 @@ void setup_cg(gd_thread_params& t)
 	      else // just finished all second gradients
 		{
 		  if(global.master_location != "") {
-		    curvature = accumulate_scalar(socks, curvature);  //Accumulate curvatures
+		    curvature = accumulate_scalar(global.master_location, curvature);  //Accumulate curvatures
 		  }
 		  if (global.regularization > 0.)
 		    curvature += regularizer_direction_magnitude(reg,global.regularization);
@@ -476,10 +441,12 @@ void setup_cg(gd_thread_params& t)
 		    }
 		  step_size = - dd/curvature;
 		  if (!global.quiet) {
-		    fprintf(stderr, "%-e\t%-e\t%-f\n", curvature/importance_weight_sum, step_size, 0.5*step_size*step_size*curvature /importance_weight_sum);
+		    //fprintf(stderr, "%-e\t%-e\t%-e\t%-f\t%-f\n", curvature/importance_weight_sum, d_mag/importance_weight_sum, step_size, 0.5*step_size*step_size*curvature /importance_weight_sum, dd/previous_d_mag);
+		    fprintf(stderr, "%-e\t%-e\t%-e\t%-f\t%-f\n", curvature/importance_weight_sum, 0.0, step_size, 0.5*step_size*step_size*curvature /importance_weight_sum, dd/previous_d_mag);
 		    //fprintf(stdout, "Net comm. time is %f\n",net_comm_time - prev_comm_time);
+
 		  }
-		  prev_comm_time = net_comm_time;
+		  //prev_comm_time = net_comm_time;
 		  predictions.erase();
 		  update_weight(reg,step_size);
 
@@ -542,7 +509,7 @@ void setup_cg(gd_thread_params& t)
 	  if (example_number == predictions.index())//do one last update
 	    {
 	      if(global.master_location != "") {
-		curvature = accumulate_scalar(socks, curvature);  //Accumulate curvatures
+		curvature = accumulate_scalar(global.master_location, curvature);  //Accumulate curvatures
 	      }
 	      if (global.regularization > 0.)
 		curvature += regularizer_direction_magnitude(reg,global.regularization);
@@ -554,7 +521,8 @@ void setup_cg(gd_thread_params& t)
 		}
 	      float step_size = - dd/(max(curvature,1.));
 	      if (!global.quiet) {
-		fprintf(stderr, "%-e\t%-e\t%-f\n", curvature, step_size, 0.5*step_size*step_size*curvature/importance_weight_sum);
+		//fprintf(stderr, "%-e\t%-e\t%-e\t%-f\t%-f\n", curvature/importance_weight_sum, d_mag/importance_weight_sum, step_size/importance_weight_sum, 0.5*step_size*step_size*curvature/importance_weight_sum, dd/previous_d_mag);
+		fprintf(stderr, "%-e\t%-e\t%-e\t%-f\t%-f\n", curvature/importance_weight_sum, 0.0, step_size/importance_weight_sum, 0.5*step_size*step_size*curvature/importance_weight_sum, dd/previous_d_mag);
 		//fprintf(stdout, "Net comm. time is %f\n",net_comm_time - prev_comm_time);
 	      }
 	      update_weight(reg,step_size);
@@ -562,20 +530,18 @@ void setup_cg(gd_thread_params& t)
 	  if (output_regularizer)//need to accumulate and place the regularizer.
 	    {
 	      if(global.master_location != "")
-		accumulate(socks, reg, 3); //Accumulate preconditioner
+		accumulate(global.master_location, reg, 3); //Accumulate preconditioner
 	      preconditioner_to_regularizer(reg,global.regularization);
 	    }
 	  ftime(&t_end_global);
 	  net_time += (int) (1000.0 * (t_end_global.time - t_start_global.time) + (t_end_global.millitm - t_start_global.millitm)); 
 	  if (!global.quiet)
 	    {
-	      cerr<<"Net time spent in communication = "<<(float)net_comm_time/(float)1000<<" seconds\n";
+	      //cerr<<"Net time spent in communication = "<<(float)net_comm_time/(float)1000<<" seconds\n";
 	      cerr<<"Net time spent = "<<(float)net_time/(float)1000<<" seconds\n";
 	    }
 	  if (global.local_prediction > 0)
 	    shutdown(global.local_prediction, SHUT_WR);
-	  if(global.master_location != "")
-	    all_reduce_close(socks);
 	  free(predictions.begin);
 	  free(old_first_derivative);
 	  free(ec);
@@ -586,15 +552,13 @@ void setup_cg(gd_thread_params& t)
 	;//busywait when we have predicted on all examples but not yet trained on all.
     }
   
-  if(global.master_location != "")
-    all_reduce_close(socks);
   free(predictions.begin);
   free(old_first_derivative);
   ftime(&t_end_global);
   net_time += (int) (1000.0 * (t_end_global.time - t_start_global.time) + (t_end_global.millitm - t_start_global.millitm)); 
-  cerr<<"Net time spent in communication = "<<(float)net_comm_time/(float)1000<<"seconds\n";
-  cerr<<"Net time spent = "<<(float)net_time/(float)1000<<"seconds\n";
-  fflush(stderr);
+  //cerr<<"Net time spent in communication = "<<(float)net_comm_time/(float)1000<<"seconds\n";
+  if(!global.quiet)
+    cerr<<"Net time spent = "<<(float)net_time/(float)1000<<"seconds\n";
 
   t.reg = reg;
   return;

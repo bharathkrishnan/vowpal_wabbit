@@ -10,6 +10,11 @@ embodied in the content of this file are licensed under the BSD
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+
+#if defined(__SSE2__) && !defined(VW_LDA_NO_SSE)
+#include <xmmintrin.h>
+#endif
+
 #include "parse_example.h"
 #include "constant.h"
 #include "sparse_dense.h"
@@ -18,6 +23,8 @@ embodied in the content of this file are licensed under the BSD
 #include "multisource.h"
 #include "simple_label.h"
 #include "delay_ring.h"
+#include "allreduce.h"
+#include "accumulate.h"
 
 void adaptive_inline_train(regressor &reg, example* &ec, size_t thread_num, float update);
 
@@ -30,10 +37,12 @@ void* gd_thread(void *in)
   example* ec = NULL;
   size_t current_pass = 0;
 
+  
   while ( true )
     {//this is a poor man's select operation.
       if ((ec = get_delay_example(thread_num)) != NULL)//nonblocking
 	{
+
 	  if (ec->pass != current_pass)
 	    {
 	      global.eta *= global.eta_decay_rate;
@@ -48,11 +57,21 @@ void* gd_thread(void *in)
       else if ((ec = get_example(thread_num)) != NULL)//semiblocking operation.
 	{
 	  assert(ec->in_use);
-	  if ( (ec->tag).end == (ec->tag).begin+4 
-	       && ((ec->tag)[0] == 's')&&((ec->tag)[1] == 'a')&&((ec->tag)[2] == 'v')&&((ec->tag)[3] == 'e'))
+
+	  if (ec->pass != current_pass && global.master_location != "")
 	    {
-	      if ((*(params->final_regressor_name)) != "") 
-		dump_regressor(*(params->final_regressor_name), reg);
+	      if(global.master_location != "") {
+		if(global.adaptive)
+		  //accumulate_avg(*(params->socks), params->reg, 0);	      
+		  accumulate_weighted_avg(global.master_location, params->reg);
+		else 
+		  accumulate_avg(global.master_location, params->reg, 0);	      
+	      }
+	    }
+
+	  if (command_example(ec, params))
+	    {
+	      ec->threads_to_finish--;
 	      delay_example(ec,0);
 	    }
 	  else
@@ -68,6 +87,13 @@ void* gd_thread(void *in)
 	      for(uint32_t i = 0; i < length; i++)
 		reg.weight_vectors[0][stride*i] = real_weight(reg.weight_vectors[0][stride*i],gravity);
 	    }
+	  if(global.master_location != "") {
+	    if(global.adaptive)
+	      //  accumulate_avg(*(params->socks), params->reg, 0);	      
+	      accumulate_weighted_avg(global.master_location, params->reg);
+	    else 
+	      accumulate_avg(global.master_location, params->reg, 0);	      
+	  }
 	  if (global.local_prediction > 0)
 	    shutdown(global.local_prediction, SHUT_WR);
 	  return NULL;
@@ -75,8 +101,28 @@ void* gd_thread(void *in)
       else 
 	;//busywait when we have predicted on all examples but not yet trained on all.
     }
-
   return NULL;
+}
+
+bool command_example(example* ec, gd_thread_params* params) {
+  if (ec->indices.index() > 1)
+    return false;
+
+  if (ec->tag.index() >= 4 && !strncmp((const char*) ec->tag.begin, "save", 4))
+    {
+      string final_regressor_name = *(params->final_regressor_name);
+
+      if ((ec->tag).index() >= 6 && (ec->tag)[4] == '_')
+	final_regressor_name = string(ec->tag.begin+5, (ec->tag).index()-5);
+
+      if (!global.quiet)
+	cerr << "saving regressor to " << final_regressor_name << endl;
+      dump_regressor(final_regressor_name, *(global.reg));
+
+      return true;
+    }
+
+  return false;
 }
 
 float finalize_prediction(float ret) 
@@ -134,7 +180,6 @@ float query_decision(example*, float k);
 
 void output_and_account_example(example* ec)
 {
-  global.example_number++;
   label_data* ld = (label_data*)ec->ld;
   global.weighted_examples += ld->weight;
   global.weighted_labels += ld->label == FLT_MAX ? 0 : ld->label * ld->weight;
@@ -167,6 +212,12 @@ void output_and_account_example(example* ec)
 	  global.print(f, ec->final_prediction, w*ec->global_weight, ec->tag);
 	}
     }
+
+  pthread_mutex_lock(&output_lock);
+  global.example_number++;
+  pthread_cond_signal(&output_done);
+  pthread_mutex_unlock(&output_lock);
+
   print_update(ec);
 }
 
@@ -394,7 +445,15 @@ void one_pf_quad_adaptive_update(weight* weights, feature& page_feature, v_array
     {
       weight* w=&weights[(halfhash + ele->weight_index) & mask];
       w[1] += update2 * ele->x * ele->x;
+#if defined(__SSE2__) && !defined(VW_LDA_NO_SSE)
+      float t;
+      __m128 eta = _mm_load_ss(&w[1]);
+      eta = _mm_rsqrt_ss(eta);
+      _mm_store_ss(&t, eta);
+      t *= ele->x;
+#else
       float t = ele->x*InvSqrt(w[1]);
+#endif
       w[0] += update * t;
     }
 }
@@ -425,7 +484,15 @@ void adaptive_inline_train(regressor &reg, example* &ec, size_t thread_num, floa
 	{
 	  weight* w = &weights[f->weight_index & thread_mask];
 	  w[1] += g * f->x * f->x;
+#if defined(__SSE2__) && !defined(VW_LDA_NO_SSE)
+      float t;
+      __m128 eta = _mm_load_ss(&w[1]);
+      eta = _mm_rsqrt_ss(eta);
+      _mm_store_ss(&t, eta);
+      t *= f->x;
+#else
 	  float t = f->x*InvSqrt(w[1]);
+#endif
 	  w[0] += update * t;
 	}
     }
@@ -450,7 +517,15 @@ float xGx_quad(weight* weights, feature& page_feature, v_array<feature> &offer_f
   for (feature* ele = offer_features.begin; ele != offer_features.end; ele++)
     {
       weight* w=&weights[(halfhash + ele->weight_index) & mask];
+#if defined(__SSE2__) && !defined(VW_LDA_NO_SSE)
+      float m = w[1] + update2 * ele->x * ele->x;
+      __m128 eta = _mm_load_ss(&m);
+      eta = _mm_rsqrt_ss(eta);
+      _mm_store_ss(&m, eta);
+      float t = ele->x * m;
+#else
       float t = ele->x*InvSqrt(w[1] + update2 * ele->x * ele->x);
+#endif
       xGx += t * ele->x;
       magx += fabsf(ele->x);
     }
@@ -473,7 +548,15 @@ float compute_xGx(regressor &reg, example* &ec, size_t thread_num, float& magx)
       for (; f != ec->subsets[*i][thread_num+1]; f++)
 	{
 	  weight* w = &weights[f->weight_index & thread_mask];
+#if defined(__SSE2__) && !defined(VW_LDA_NO_SSE)
+      float m = w[1] + g * f->x * f->x;
+      __m128 eta = _mm_load_ss(&m);
+      eta = _mm_rsqrt_ss(eta);
+      _mm_store_ss(&m, eta);
+      float t = f->x * m;
+#else
 	  float t = f->x*InvSqrt(w[1] + g * f->x * f->x);
+#endif
 	  xGx += t * f->x;
 	  magx += fabsf(f->x);
 	}
